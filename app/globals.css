@@ -1,0 +1,29 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-accent: #ff6900;
+  --color-ink: #000000;
+  --color-hairline: #e5e5e5;
+  --color-bar: #f5f5f5;
+  --color-muted: #6a6a6a;
+  --font-sans: var(--font-inter), 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+html,
+body {
+  background: #ffffff;
+  color: var(--color-ink);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Nav rows scroll sideways on narrow screens instead of widening the page. */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
