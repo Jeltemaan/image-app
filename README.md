@@ -42,6 +42,23 @@ npx vercel
 Set `N8N_WEBHOOK_URL` as an environment variable in the Vercel project settings
 (Production, Preview and Development).
 
+## Security
+
+`N8N_WEBHOOK_URL` is a server-only env var, so it never reaches the browser. Treat it
+as a credential: anyone holding that URL can trigger your workflow and spend image
+generations. `.env.example` contains a placeholder only.
+
+Because `/api/tryon` costs money per call, it is rate limited to 6 requests per minute
+per IP, restricted to same-origin browser requests, capped at 6 MB per request, and
+validates uploads by magic bytes rather than by the client's declared type. Responses
+are allowlisted to JPEG/PNG/WEBP — an `image/svg+xml` reply is refused, since SVG can
+carry script. Upstream error bodies are logged server-side and never returned to the
+caller. Security headers including a CSP are set in `next.config.ts`.
+
+The rate limiter is in-process, so on Vercel it applies per instance and resets on cold
+start — enough for casual abuse, not a determined one. Use a shared store (Upstash,
+Redis) if this goes anywhere public with real traffic.
+
 ## Uploads
 
 JPEG, JPG, PNG and WEBP are accepted. Vercel caps serverless request bodies at

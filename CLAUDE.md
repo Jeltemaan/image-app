@@ -80,6 +80,40 @@ Known open issue: sending two 1×1 pixel JPEGs still returns a fully-composed ph
 which means the workflow is likely not binding the received binaries to its image node
 and is falling back to static test data. The frontend side is confirmed correct.
 
+### Security model
+
+`/api/tryon` is a **public endpoint that spends money** — one Gemini image
+generation per call — so it is treated as a paid resource, not a convenience proxy.
+In order, every request passes: same-origin check → rate limit → body size cap →
+`formData()` → magic-byte validation → upstream fetch → response-type allowlist.
+
+Invariants to preserve when editing that route:
+
+- **Never echo an upstream response body to the client.** n8n error payloads carry
+  workflow internals and node names. They go to `console.error` only; the caller
+  gets a fixed message.
+- **The response type is an allowlist, not `startsWith('image/')`.** `image/svg+xml`
+  is scriptable XML; served from the app's own origin it is stored XSS.
+- **Client-declared MIME types are ignored.** `lib/upload-guard.ts` sniffs magic
+  bytes and rebuilds each blob with a server-chosen type and filename. Original
+  filenames are discarded, not sanitised — nothing downstream needs them.
+- The rate limiter (`lib/rate-limit.ts`) is in-process, so on Vercel it is per
+  instance and resets on cold start. It stops casual hammering, not a distributed
+  attacker; swap in a shared store if this gets real traffic.
+- The same-origin check is CSRF defence, **not authentication** — requests with no
+  `Origin` header (curl, server-to-server) pass through to the rate limiter. There is
+  deliberately no auth: the page is meant to be publicly usable.
+
+`N8N_WEBHOOK_URL` is server-only (never `NEXT_PUBLIC_`), so it stays out of the
+client bundle. `.env.example` holds a placeholder; the real URL lives only in the
+gitignored `.env.local` and in Vercel env vars. Treat that URL as a credential —
+anyone holding it can invoke the workflow.
+
+Security headers, including the CSP, are in `next.config.ts`. `script-src` still
+needs `'unsafe-inline'` for Next's hydration bootstrap; removing it requires
+per-request nonces via middleware, which is the first thing to tighten if the app
+ever renders user-supplied content.
+
 ### Image size budget
 
 Vercel caps serverless request bodies at ~4.5 MB, so `lib/image.ts` gives each file a

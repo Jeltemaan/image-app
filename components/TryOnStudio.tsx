@@ -21,6 +21,13 @@ const PROGRESS_STEPS = [
   'Almost there…',
 ];
 
+/** Result types the route can return, mapped to a download extension. */
+const RESULT_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+
 /** Generous ceiling: the webhook itself normally answers in 10-30 seconds. */
 const REQUEST_TIMEOUT_MS = 90_000;
 
@@ -29,6 +36,7 @@ export default function TryOnStudio() {
   const [garment, setGarment] = useState<Selection | null>(null);
   const [status, setStatus] = useState<Status>('idle');
   const [resultUrl, setResultUrl] = useState<string | null>(null);
+  const [resultExt, setResultExt] = useState('jpg');
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState(0);
 
@@ -150,7 +158,9 @@ export default function TryOnStudio() {
       }
 
       const blob = await response.blob();
-      if (!blob.type.startsWith('image/') || blob.size === 0) {
+      // The route already allowlists the type; this guards against a proxy or
+      // service worker substituting something else in between.
+      if (!RESULT_EXTENSIONS[blob.type] || blob.size === 0) {
         throw new Error(
           'The webhook did not return an image. Check that the workflow ends with a binary image response.',
         );
@@ -158,6 +168,7 @@ export default function TryOnStudio() {
 
       release(resultUrl);
       setResultUrl(track(URL.createObjectURL(blob)));
+      setResultExt(RESULT_EXTENSIONS[blob.type]);
       setStatus('success');
     } catch (caught) {
       const aborted =
@@ -256,7 +267,7 @@ export default function TryOnStudio() {
           <div className="mt-4 flex flex-wrap gap-3">
             <a
               href={resultUrl}
-              download="tryon-result.png"
+              download={`tryon-result.${resultExt}`}
               className="inline-flex items-center gap-2 rounded-full bg-ink px-6 py-3 text-sm font-bold text-white transition hover:opacity-85"
             >
               <Download size={16} aria-hidden="true" />

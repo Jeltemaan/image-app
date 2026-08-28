@@ -1,11 +1,21 @@
 import { NextResponse } from 'next/server';
+import { MAX_REQUESTS, clientKey, rateLimit } from '@/lib/rate-limit';
+import {
+  ALLOWED_RESPONSE_TYPES,
+  MAX_TOTAL_BYTES,
+  checkImage,
+} from '@/lib/upload-guard';
 
 /**
  * Server-side proxy to the n8n webhook.
  *
  * The browser cannot call n8n directly: n8n sends no Access-Control-Allow-Origin
  * header by default, so the request dies in CORS preflight. Forwarding it from the
- * server sidesteps that entirely and keeps the webhook URL out of the client bundle.
+ * server sidesteps that and keeps the webhook URL out of the client bundle.
+ *
+ * Every call costs an image generation upstream, so this route is treated as a paid
+ * endpoint: rate limited, same-origin only, and strict about what it accepts and
+ * what it passes back.
  */
 
 // The generation takes 10-30 seconds, well past Vercel's default function limit.
@@ -14,21 +24,66 @@ export const dynamic = 'force-dynamic';
 
 const UPSTREAM_TIMEOUT_MS = 55_000;
 
-function textError(message: string, status: number) {
+function textError(
+  message: string,
+  status: number,
+  headers: Record<string, string> = {},
+) {
   return new NextResponse(message, {
     status,
-    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      ...headers,
+    },
   });
+}
+
+/**
+ * Rejects cross-site browser calls. Requests without an Origin (curl, server to
+ * server) are allowed through to the rate limiter: this stops a page on another
+ * domain from spending the quota, it is not authentication.
+ */
+function isSameOrigin(request: Request): boolean {
+  const origin = request.headers.get('origin');
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === request.headers.get('host');
+  } catch {
+    return false;
+  }
 }
 
 export async function POST(request: Request) {
   const webhookUrl = process.env.N8N_WEBHOOK_URL;
 
   if (!webhookUrl) {
+    // Deliberately vague to the caller; the detail goes to the server log.
+    console.error('[tryon] N8N_WEBHOOK_URL is not set');
+    return textError('The service is not configured. Please try again later.', 503);
+  }
+
+  if (!isSameOrigin(request)) {
+    return textError('Cross-origin requests are not allowed.', 403);
+  }
+
+  const limit = rateLimit(clientKey(request));
+  if (!limit.allowed) {
     return textError(
-      'The server is missing N8N_WEBHOOK_URL. Add it to .env.local (or the Vercel project settings) and restart.',
-      500,
+      'Too many requests. Please wait a moment and try again.',
+      429,
+      {
+        'Retry-After': String(limit.retryAfterSeconds),
+        'X-RateLimit-Limit': String(MAX_REQUESTS),
+        'X-RateLimit-Remaining': '0',
+      },
     );
+  }
+
+  // Reject an oversized body before buffering it into memory.
+  const declaredLength = Number(request.headers.get('content-length') ?? 0);
+  if (declaredLength > MAX_TOTAL_BYTES) {
+    return textError('Those images are too large.', 413);
   }
 
   let incoming: FormData;
@@ -45,11 +100,28 @@ export async function POST(request: Request) {
     return textError('Both image1 and image2 are required.', 400);
   }
 
-  // Rebuild the body so only the two expected fields are forwarded. No
-  // Content-Type header is set: fetch derives it, including the boundary.
+  if (image1.size + image2.size > MAX_TOTAL_BYTES) {
+    return textError('Those images are too large.', 413);
+  }
+
+  // Verify the actual bytes, not the client's claimed content type.
+  const checked = await Promise.all([
+    checkImage(image1, 'image1'),
+    checkImage(image2, 'image2'),
+  ]);
+  const failure = checked.find((result) => !result.ok);
+  if (failure && !failure.ok) {
+    return textError(failure.error, 400);
+  }
+  const [first, second] = checked.flatMap((result) =>
+    result.ok ? [result.value] : [],
+  );
+
+  // Only the two expected fields are forwarded, with server-chosen filenames.
+  // No Content-Type header is set: fetch derives it, including the boundary.
   const outgoing = new FormData();
-  outgoing.append('image1', image1, image1.name || 'image1.jpg');
-  outgoing.append('image2', image2, image2.name || 'image2.jpg');
+  outgoing.append('image1', first.blob, first.filename);
+  outgoing.append('image2', second.blob, second.filename);
 
   let upstream: Response;
   try {
@@ -58,6 +130,7 @@ export async function POST(request: Request) {
       body: outgoing,
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
       cache: 'no-store',
+      redirect: 'error',
     });
   } catch (caught) {
     if (caught instanceof DOMException && caught.name === 'TimeoutError') {
@@ -66,13 +139,19 @@ export async function POST(request: Request) {
         504,
       );
     }
-    return textError('Could not reach the workflow. Check your connection.', 502);
+    console.error('[tryon] upstream fetch failed:', caught);
+    return textError('Could not reach the workflow. Please try again.', 502);
   }
 
-  const contentType = upstream.headers.get('content-type') ?? '';
+  const contentType = (upstream.headers.get('content-type') ?? '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
 
   if (!upstream.ok) {
-    const detail = (await upstream.text().catch(() => '')).slice(0, 400);
+    // Upstream bodies can carry workflow internals, so they are logged, never returned.
+    const detail = (await upstream.text().catch(() => '')).slice(0, 1000);
+    console.error(`[tryon] upstream ${upstream.status}: ${detail}`);
 
     // A 404 means the webhook path is not registered, for one of two reasons.
     if (upstream.status === 404) {
@@ -85,26 +164,32 @@ export async function POST(request: Request) {
     }
 
     return textError(
-      `The workflow returned status ${upstream.status}.${detail ? ` ${detail}` : ''}`,
+      'The workflow could not produce an image. Please try again.',
       502,
     );
   }
 
-  if (!contentType.startsWith('image/')) {
-    const detail = (await upstream.text().catch(() => '')).slice(0, 400);
+  // Allowlist, not a prefix test: "image/svg+xml" is scriptable XML and must never
+  // reach the browser from this route.
+  if (!ALLOWED_RESPONSE_TYPES.includes(contentType)) {
+    const detail = (await upstream.text().catch(() => '')).slice(0, 1000);
+    console.error(
+      `[tryon] unexpected upstream content-type "${contentType}": ${detail}`,
+    );
     return textError(
-      `The workflow answered with ${contentType || 'an unknown type'} instead of an image. Make sure the final node responds with the binary file.${
-        detail ? ` It said: ${detail}` : ''
-      }`,
+      'The workflow did not return a JPEG, PNG or WEBP image. Make sure its final node responds with the binary file.',
       502,
     );
   }
 
-  // Stream the image straight through to the browser.
+  // Stream the image through, pinned to the verified type so nothing sniffs it
+  // into something executable.
   return new NextResponse(upstream.body, {
     status: 200,
     headers: {
       'Content-Type': contentType,
+      'Content-Disposition': 'inline; filename="tryon-result"',
+      'X-Content-Type-Options': 'nosniff',
       'Cache-Control': 'no-store',
     },
   });
