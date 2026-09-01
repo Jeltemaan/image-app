@@ -27,6 +27,15 @@ curl -X POST -F "image1=@person.jpg" -F "image2=@garment.png" \
 A `200` with `image/jpeg` and a few hundred KB is success. Any failure comes back as
 **plain text** intended for direct display to the user, not JSON.
 
+Two things to keep in mind while testing that route:
+
+- It is rate limited to **6 requests per minute** per client, and rejected requests
+  count too. A burst of curl tests will start returning `429`; wait out the window
+  rather than assuming a regression.
+- Every successful call spends a real image generation upstream. Exercise validation
+  and error paths with deliberately invalid payloads, which are refused before the
+  upstream fetch and therefore cost nothing.
+
 ## Architecture
 
 Next.js 15 App Router + TypeScript + Tailwind v4 + lucide-react. Single page, no
@@ -45,11 +54,19 @@ UploadTile ×2  →  TryOnStudio  →  POST /api/tryon  →  n8n webhook  →  b
   and the fetch. Every UI state derives from `status`.
 - `components/UploadTile.tsx` — one upload tile, used twice. Owns its own validation
   error and "preparing" state; reports upward only the finished `File`.
-- `lib/image.ts` — file-type validation and browser-side downscaling. Pure except for
+- `lib/image.ts` — client-side file-type validation and downscaling. Pure except for
   the canvas work.
-- `app/api/tryon/route.ts` — the server-side forward to n8n.
+- `app/api/tryon/route.ts` — the server-side forward to n8n, plus every guard listed
+  under "Security model".
+- `lib/upload-guard.ts` — server-side magic-byte validation and size limits.
+- `lib/rate-limit.ts` — in-process fixed-window limiter for the route.
 - `app/page.tsx` — static shell (utility bar, header, nav, tips footer). Server
   component; no logic.
+- `next.config.ts` — security headers and the CSP.
+
+Note the deliberate duplication: `lib/image.ts` (client) and `lib/upload-guard.ts`
+(server) both validate types. The client copy is UX, the server copy is the actual
+boundary. Changing one does not change the other.
 
 ### Why the request is proxied
 
@@ -67,8 +84,9 @@ must be derived by the browser and by `undici` respectively.
 
 `N8N_WEBHOOK_URL` (`.env.local`, and a Vercel env var per environment) must accept
 `image1` and `image2` as `multipart/form-data` and respond with the image as a
-**binary file**, not JSON. The route rejects any response whose `Content-Type` is not
-`image/*` and explains why in its error text.
+**binary file**, not JSON. The route returns only `image/jpeg`, `image/png` or
+`image/webp` (see the allowlist under "Security model"); anything else, including
+JSON, is refused with an explanation.
 
 Two n8n paths, and the route's 404 handler distinguishes them:
 
