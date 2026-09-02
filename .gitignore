@@ -73,3 +73,6 @@ $RECYCLE.BIN/
 tmp/
 temp/
 scratch/
+
+# mcp servers
+.mcp.json
