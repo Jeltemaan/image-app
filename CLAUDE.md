@@ -132,6 +132,52 @@ needs `'unsafe-inline'` for Next's hydration bootstrap; removing it requires
 per-request nonces via middleware, which is the first thing to tighten if the app
 ever renders user-supplied content.
 
+### Auth
+
+Email + password accounts via Supabase, project `htpiluwvhvqjwaqkfnms`. The whole app
+is behind the login: `middleware.ts` redirects any signed-out request to `/login`,
+`/login` and `/signup` being the only public paths.
+
+- `lib/supabase/env.ts` — the two `NEXT_PUBLIC_` values, validated once. They must be
+  written as literal `process.env.NEXT_PUBLIC_X` member reads; Next only inlines that
+  exact expression into the client bundle, so `process.env[name]` silently yields
+  `undefined` in the browser.
+- `lib/supabase/client.ts` / `server.ts` — the browser and cookie-backed server
+  clients from `@supabase/ssr`. Sessions live in cookies, not localStorage, so the
+  middleware, server components and the route handler all see the same session.
+- `app/auth/actions.ts` — `signUp`, `signIn`, `signOut` server actions.
+- `components/AuthForm.tsx` — one client form, `mode` prop switches login/signup.
+
+Invariants:
+
+- **Always `getUser()`, never `getSession()`.** `getSession` trusts the cookie as-is;
+  `getUser` revalidates the JWT with the auth server. Every gate in this app uses
+  `getUser`.
+- **`/api/tryon` guards itself and returns `401`, not a redirect.** `/api/*` is
+  excluded from the middleware matcher so an API caller gets a readable plain-text
+  message rather than a `302` to HTML. The check sits after the same-origin check and
+  before `formData()`.
+- **Login is the cost control**, the rate limiter is the second layer. A curl without
+  cookies no longer reaches n8n.
+- **Email confirmation is deliberately off** (Authentication > Sign In / Providers >
+  Email in the dashboard). `signUp` still handles the confirmation-on case explicitly:
+  Supabase returns a user with no session, and without that branch the user would be
+  redirected to `/` and bounced straight back to `/login`.
+- **`connect-src` in `next.config.ts` must include the Supabase origin.** It is derived
+  from `NEXT_PUBLIC_SUPABASE_URL` so the two cannot drift. Omitting it fails silently —
+  login simply never completes, with only a CSP violation in the console.
+
+`public.profiles` mirrors `id`, `full_name` and `email` from `auth.users`, written by
+the `on_auth_user_created` trigger reading `raw_user_meta_data->>'full_name'`. RLS is
+on with select/update policies scoped to `auth.uid() = id`; there is no insert policy
+because rows only ever arrive via the trigger, whose `EXECUTE` is revoked from `anon`
+and `authenticated` so it is not callable over `/rest/v1/rpc`. App code never queries
+`auth.users`.
+
+Both `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` must also be
+set in the Vercel project for every environment. They are public by design — RLS is the
+boundary — but the service-role key must never enter this repo.
+
 ### Image size budget
 
 Vercel caps serverless request bodies at ~4.5 MB, so `lib/image.ts` gives each file a

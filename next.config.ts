@@ -3,10 +3,19 @@ import type { NextConfig } from 'next';
 const isDev = process.env.NODE_ENV === 'development';
 
 /**
+ * Origin of the Supabase project, taken from the same env var the app reads so the
+ * two can never drift. Empty when unset, which only happens in a misconfigured
+ * build that would fail on its first Supabase call anyway.
+ */
+const SUPABASE_ORIGIN = process.env.NEXT_PUBLIC_SUPABASE_URL ?? '';
+
+/**
  * Content Security Policy.
  *
  * - img-src needs blob: because previews and the result are Object URLs.
- * - connect-src is 'self' only: the browser never talks to n8n directly.
+ * - connect-src is 'self' plus the Supabase project: the browser never talks to n8n
+ *   directly, but the Supabase auth client does call the project from the page.
+ *   Leaving that origin out fails silently - login just never completes.
  * - script-src carries 'unsafe-inline' because Next's hydration bootstrap is an
  *   inline script; removing it needs per-request nonces via middleware. This app
  *   renders no user-supplied HTML and has no dangerouslySetInnerHTML, so the
@@ -25,7 +34,9 @@ const csp = [
   isDev
     ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
     : "script-src 'self' 'unsafe-inline'",
-  isDev ? "connect-src 'self' ws:" : "connect-src 'self'",
+  isDev
+    ? `connect-src 'self' ws: ${SUPABASE_ORIGIN}`
+    : `connect-src 'self' ${SUPABASE_ORIGIN}`,
   'upgrade-insecure-requests',
 ].join('; ');
 

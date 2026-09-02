@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { MAX_REQUESTS, clientKey, rateLimit } from '@/lib/rate-limit';
+import { createClient } from '@/lib/supabase/server';
 import {
   ALLOWED_RESPONSE_TYPES,
   MAX_TOTAL_BYTES,
@@ -14,8 +15,8 @@ import {
  * server sidesteps that and keeps the webhook URL out of the client bundle.
  *
  * Every call costs an image generation upstream, so this route is treated as a paid
- * endpoint: rate limited, same-origin only, and strict about what it accepts and
- * what it passes back.
+ * endpoint: authenticated, rate limited, same-origin only, and strict about what it
+ * accepts and what it passes back.
  */
 
 // The generation takes 10-30 seconds, well past Vercel's default function limit.
@@ -65,6 +66,19 @@ export async function POST(request: Request) {
 
   if (!isSameOrigin(request)) {
     return textError('Cross-origin requests are not allowed.', 403);
+  }
+
+  // Signed-in callers only. This is the primary cost control - the rate limiter
+  // below is the second layer. It runs before formData() so an anonymous caller is
+  // refused without the body ever being buffered, and after the same-origin check
+  // so the CSRF ordering is unchanged.
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return textError('Please sign in to generate an image.', 401);
   }
 
   const limit = rateLimit(clientKey(request));

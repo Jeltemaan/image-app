@@ -1,4 +1,6 @@
 import TryOnStudio from '@/components/TryOnStudio';
+import { AccountMenu } from '@/components/AuthShell';
+import { createClient } from '@/lib/supabase/server';
 
 const utilityLinks = [
   'How it works',
@@ -54,7 +56,18 @@ const tipColumns = [
   },
 ];
 
-export default function Home() {
+export default async function Home() {
+  // The middleware already guarantees a session here; this read is only for the
+  // name in the header. getUser, not getSession - it verifies the JWT.
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  const fullName =
+    typeof user?.user_metadata?.full_name === 'string'
+      ? user.user_metadata.full_name
+      : '';
+
   return (
     <div className="min-h-screen bg-white">
       {/* Utility bar */}
@@ -100,18 +113,7 @@ export default function Home() {
               <span className="hidden text-xs font-bold underline sm:inline">
                 EN
               </span>
-              <svg
-                width="22"
-                height="22"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.6"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="8" r="3.6" />
-                <path d="M4.5 20c1.2-4 4-5.6 7.5-5.6S18.3 16 19.5 20" />
-              </svg>
+              <AccountMenu name={fullName} />
               <svg
                 width="22"
                 height="22"
