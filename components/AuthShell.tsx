@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import { signOut } from '@/app/auth/actions';
 
 /** The orange play triangle + lowercase wordmark, as on the home page. */
@@ -53,6 +54,12 @@ export function AccountMenu({ name }: { name: string }) {
       <span className="hidden text-xs font-bold tracking-tight sm:inline">
         {firstName}
       </span>
+      <Link
+        href="/billing"
+        className="rounded-full border border-hairline px-3 py-1.5 text-xs font-bold transition hover:border-ink"
+      >
+        Plan
+      </Link>
       <form action={signOut}>
         <button
           type="submit"

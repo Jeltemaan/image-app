@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { MAX_REQUESTS, clientKey, rateLimit } from '@/lib/rate-limit';
 import { createClient } from '@/lib/supabase/server';
+import { getSubscription, hasActiveAccess } from '@/lib/billing';
 import {
   ALLOWED_RESPONSE_TYPES,
   MAX_TOTAL_BYTES,
@@ -15,8 +16,8 @@ import {
  * server sidesteps that and keeps the webhook URL out of the client bundle.
  *
  * Every call costs an image generation upstream, so this route is treated as a paid
- * endpoint: authenticated, rate limited, same-origin only, and strict about what it
- * accepts and what it passes back.
+ * endpoint: authenticated, subscribed, rate limited, same-origin only, and strict
+ * about what it accepts and what it passes back.
  */
 
 // The generation takes 10-30 seconds, well past Vercel's default function limit.
@@ -79,6 +80,18 @@ export async function POST(request: Request) {
 
   if (!user) {
     return textError('Please sign in to generate an image.', 401);
+  }
+
+  // Paying callers only. This is the real cost control - every call below spends
+  // an image generation upstream. It sits here, immediately after the identity
+  // check and still before formData(), so an unpaid caller is refused without
+  // the body ever being buffered. The message is shown to the user verbatim.
+  const subscription = await getSubscription(supabase, user.id);
+  if (!hasActiveAccess(subscription)) {
+    return textError(
+      'Your subscription is not active. Open your account page to subscribe.',
+      402,
+    );
   }
 
   const limit = rateLimit(clientKey(request));

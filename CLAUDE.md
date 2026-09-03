@@ -27,8 +27,11 @@ curl -X POST -F "image1=@person.jpg" -F "image2=@garment.png" \
 A `200` with `image/jpeg` and a few hundred KB is success. Any failure comes back as
 **plain text** intended for direct display to the user, not JSON.
 
-Two things to keep in mind while testing that route:
+Three things to keep in mind while testing that route:
 
+- **A bare curl now gets `401`.** The route requires a session and curl carries no
+  auth cookie, so that is the guard working, not a regression. Drive the happy path
+  through the browser while signed in, or reuse a cookie jar captured from one.
 - It is rate limited to **6 requests per minute** per client, and rejected requests
   count too. A burst of curl tests will start returning `429`; wait out the window
   rather than assuming a regression.
@@ -38,15 +41,16 @@ Two things to keep in mind while testing that route:
 
 ## Architecture
 
-Next.js 15 App Router + TypeScript + Tailwind v4 + lucide-react. Single page, no
-database, no auth. Deployed on Vercel.
+Next.js 15 App Router + TypeScript + Tailwind v4 + lucide-react. One page behind a
+login, with Supabase for auth. Deployed on Vercel.
 
-The whole app is one pipeline: two local files → an n8n webhook → one binary image.
+The whole app is one pipeline: two local files → an n8n webhook → one binary image,
+with every page and the route behind a Supabase session.
 
 ```
-UploadTile ×2  →  TryOnStudio  →  POST /api/tryon  →  n8n webhook  →  blob → <img>
-(validate,        (state,           (server-side       (Gemini image
- downscale)        fetch)            forward)           generation)
+middleware  →  UploadTile ×2  →  TryOnStudio  →  POST /api/tryon  →  n8n  →  <img>
+(session,      (validate,        (state,           (auth, guards,     (Gemini
+ redirect)      downscale)        fetch)            forward)           image gen)
 ```
 
 - `components/TryOnStudio.tsx` — the only stateful component. Holds both selections,
@@ -60,8 +64,13 @@ UploadTile ×2  →  TryOnStudio  →  POST /api/tryon  →  n8n webhook  →  b
   under "Security model".
 - `lib/upload-guard.ts` — server-side magic-byte validation and size limits.
 - `lib/rate-limit.ts` — in-process fixed-window limiter for the route.
-- `app/page.tsx` — static shell (utility bar, header, nav, tips footer). Server
-  component; no logic.
+- `middleware.ts` — refreshes the Supabase session and gates every page.
+- `lib/supabase/` — `env.ts` (validated config), `client.ts`, `server.ts`.
+- `app/auth/actions.ts` — `signUp`, `signIn`, `signOut` server actions.
+- `components/AuthForm.tsx` / `AuthShell.tsx` — the one auth form used by both
+  modes, its frame, and the header account menu.
+- `app/page.tsx` — shell (utility bar, header, nav, tips footer). A server component;
+  its only logic is reading the user for the header.
 - `next.config.ts` — security headers and the CSP.
 
 Note the deliberate duplication: `lib/image.ts` (client) and `lib/upload-guard.ts`
@@ -100,10 +109,10 @@ and is falling back to static test data. The frontend side is confirmed correct.
 
 ### Security model
 
-`/api/tryon` is a **public endpoint that spends money** — one Gemini image
-generation per call — so it is treated as a paid resource, not a convenience proxy.
-In order, every request passes: same-origin check → rate limit → body size cap →
-`formData()` → magic-byte validation → upstream fetch → response-type allowlist.
+`/api/tryon` **spends money** — one Gemini image generation per call — so it is
+treated as a paid resource, not a convenience proxy. In order, every request passes:
+same-origin check → **auth** → rate limit → body size cap → `formData()` →
+magic-byte validation → upstream fetch → response-type allowlist.
 
 Invariants to preserve when editing that route:
 
@@ -118,9 +127,10 @@ Invariants to preserve when editing that route:
 - The rate limiter (`lib/rate-limit.ts`) is in-process, so on Vercel it is per
   instance and resets on cold start. It stops casual hammering, not a distributed
   attacker; swap in a shared store if this gets real traffic.
-- The same-origin check is CSRF defence, **not authentication** — requests with no
-  `Origin` header (curl, server-to-server) pass through to the rate limiter. There is
-  deliberately no auth: the page is meant to be publicly usable.
+- The same-origin check is CSRF defence, **not authentication**: a request with no
+  `Origin` header (curl, server-to-server) still passes it. Authentication is the
+  separate `getUser()` check immediately after, and that is what a cookieless caller
+  fails. Keep both — they defend different things.
 
 `N8N_WEBHOOK_URL` is server-only (never `NEXT_PUBLIC_`), so it stays out of the
 client bundle. `.env.example` holds a placeholder; the real URL lives only in the
@@ -177,6 +187,93 @@ and `authenticated` so it is not callable over `/rest/v1/rpc`. App code never qu
 Both `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` must also be
 set in the Vercel project for every environment. They are public by design — RLS is the
 boundary — but the service-role key must never enter this repo.
+
+### Billing
+
+The app is a **$9.99/month subscription**, sold through a hosted Stripe **Payment Link**.
+Login is no longer the cost control — the subscription is. Signed-out → `/login`;
+signed in without an active subscription → `/billing`; only a subscriber reaches `/`
+or `/api/tryon`.
+
+```
+/signup → /billing → buy.stripe.com → /billing/return?session_id=…  → /
+                          │                    │
+                          │                    └ reconcile: retrieve session, verify
+                          │                      client_reference_id, upsert. Instant.
+                          └ webhook → /api/stripe/webhook → upsert. Authoritative,
+                                      and the only path for renewals/cancellations.
+```
+
+- `lib/billing.ts` — reads the entitlement. `hasActiveAccess()` is the single
+  definition of "may generate". **Deliberately imports nothing from Stripe**, because
+  `middleware.ts` imports it and runs on the Edge runtime.
+- `lib/billing-sync.ts` — everything that talks to Stripe: `upsertSubscription` (the
+  only writer of `public.subscriptions`), `reconcileCheckoutSession`, `paymentLinkFor`.
+- `lib/stripe.ts` — the SDK client, pinned to API version `2026-08-26.dahlia`.
+- `lib/supabase/admin.ts` — the service-role client.
+- `app/api/stripe/webhook/route.ts` — signature verification, idempotency, handlers.
+- `app/api/billing/portal/route.ts` — redirect to the Stripe customer portal.
+- `app/billing/page.tsx` — the paywall; `app/billing/return/page.tsx` — the redirect target.
+
+Tables: `public.subscriptions` (one row per user, keyed by `user_id`, mirroring Stripe)
+and `public.stripe_events` (event ids, for webhook idempotency). Both have RLS on.
+`subscriptions` has a single **select** policy scoped to `auth.uid() = user_id` and no
+write policies at all; `stripe_events` has no policies at all. The only writer of either
+is the service-role client, which bypasses RLS.
+
+Invariants to preserve:
+
+- **`client_reference_id` is the user mapping, and it must be verified.** The Payment
+  Link URL carries the Supabase user id; nothing else in a Stripe object knows about
+  Supabase. `reconcileCheckoutSession` refuses a session whose `client_reference_id`
+  is not the signed-in user — without that check, the `session_id` in the return URL
+  would be a bearer token for somebody else's payment. After the first checkout,
+  events are matched on `stripe_customer_id` instead, which is why that column is
+  unique and indexed.
+- **The webhook needs the raw body.** `stripe.webhooks.constructEvent` hashes the exact
+  bytes Stripe sent, so the handler reads `await request.text()` and never parses
+  first. It also pins `runtime = 'nodejs'`.
+- **The webhook claims the event id before doing work**, and deletes the claim if the
+  handler throws. A redelivery hits the primary key on `stripe_events` and returns 200;
+  a genuine failure returns 500 so Stripe retries. Losing an event means a paying
+  customer never gets access — that is the worst failure this app has.
+- **`SUPABASE_SERVICE_ROLE_KEY` and `STRIPE_SECRET_KEY` live in `lib/supabase/admin.ts`
+  and `lib/stripe.ts` only.** Both files start with `import 'server-only'`, so a client
+  component importing them fails the build rather than leaking a key.
+- **`lib/billing.ts` must stay Stripe-free** — see above.
+- **`past_due` does not grant access.** Stripe has already failed to collect and every
+  generation costs money. A subscription set to cancel stays `active` until the period
+  ends, so cancelling does not cut access off early.
+- **`/api/tryon` returns `402`, not a redirect**, from a check placed immediately after
+  the `getUser()` check and before `formData()`. As with every other error on that
+  route, the plain-text body is displayed to the user verbatim.
+- **Links to Stripe are `<a href>`, never form POSTs.** The CSP sets `form-action 'self'`
+  and Chrome applies it to the redirect chain a submission follows, so a form landing on
+  `stripe.com` is blocked with no visible error. Stripe.js is not loaded anywhere — the
+  hosted pages are separate origins — so the CSP needs no `frame-src` or `script-src`
+  entries for Stripe.
+- **`middleware.ts` copies refreshed auth cookies onto every redirect.** A bare
+  `NextResponse.redirect` drops them and silently rolls the session back.
+
+New env vars, all server-only: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
+`STRIPE_PAYMENT_LINK_URL`, `SUPABASE_SERVICE_ROLE_KEY`. See `.env.example`. They must
+also be set in Vercel for every environment.
+
+Testing the paid flow locally needs webhooks forwarded to the dev server:
+
+```bash
+stripe listen --forward-to localhost:3001/api/stripe/webhook
+```
+
+That prints a fresh `whsec_...` on every start — put it in `.env.local` and restart
+`next dev`, or every signature check fails. Test card `4242 4242 4242 4242`, any future
+expiry, any CVC. `/billing/return` grants access without the webhook, so a signature
+mismatch shows up as renewals and cancellations silently not applying rather than as a
+failed purchase.
+
+Going live is configuration only, no code change: recreate the product, price and
+Payment Link in live mode (with the redirect pointing at the deployed URL), add a
+webhook endpoint for `/api/stripe/webhook`, and set the live values in Vercel.
 
 ### Image size budget
 

@@ -63,7 +63,9 @@ export async function signUp(
   }
 
   revalidatePath('/', 'layout');
-  redirect('/');
+  // Straight to the paywall rather than to /, which the middleware would only
+  // bounce back here anyway. A new account has no subscription by definition.
+  redirect('/billing');
 }
 
 export async function signIn(

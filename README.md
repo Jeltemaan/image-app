@@ -18,10 +18,10 @@ npm run dev
 Open **http://localhost:3001** — the dev script is pinned to `-p 3001`. You land on
 `/login`; there is a link to `/signup` if you do not have an account yet.
 
-`.env.local` is gitignored, so a fresh clone will not have one. All three variables
-are needed: without the two `NEXT_PUBLIC_SUPABASE_*` values the app throws on its
-first Supabase call, and without `N8N_WEBHOOK_URL` you can sign in but Generate
-returns a 503.
+`.env.local` is gitignored, so a fresh clone will not have one, and every variable in
+`.env.example` is needed. Without the two `NEXT_PUBLIC_SUPABASE_*` values the app throws
+on its first Supabase call; without the Stripe values you cannot get past the paywall;
+without `N8N_WEBHOOK_URL` you can subscribe but Generate returns a 503.
 
 There is no test suite. Verify changes with `npm run build` (which also runs lint and
 typecheck) or `npx tsc --noEmit`. Avoid `npm run lint` — it invokes the deprecated
@@ -55,6 +55,66 @@ Two setup steps that are **not** in the code, and that the app cannot do for you
 Supabase's *URL Configuration* (Site URL, Redirect URLs) does not apply here. Those
 matter for email links, magic links and OAuth, none of which this flow uses.
 
+## Billing
+
+The app is a **$9.99/month subscription**, sold through a hosted Stripe **Payment
+Link**. Login alone is no longer enough: a signed-out visitor goes to `/login`, a
+signed-in visitor without an active subscription goes to `/billing`, and only a
+subscriber reaches the studio or `/api/tryon`.
+
+```
+/signup → /billing → buy.stripe.com → /billing/return?session_id=… → /
+```
+
+Two independent paths grant access, on purpose:
+
+- **`/billing/return`** retrieves the Checkout Session straight from Stripe when the
+  user lands back on the app, so access is unlocked immediately rather than whenever
+  the webhook happens to arrive.
+- **`/api/stripe/webhook`** is the authority for everything afterwards — renewals,
+  failed payments, cancellations — and is the only thing that keeps the entitlement
+  correct over time.
+
+A Supabase account is tied to a Stripe payment by **`client_reference_id`**: the
+paywall appends the user id to the Payment Link, and the return page refuses any
+session whose `client_reference_id` is not the signed-in user. Without that check the
+`session_id` in the URL would be a bearer token for somebody else's payment.
+
+State lives in two tables. `public.subscriptions` holds one row per user mirroring
+Stripe (status, price, period end, cancel-at-period-end); `public.stripe_events` holds
+handled event ids so a redelivered webhook is skipped instead of reprocessed. Both have
+row level security on. `subscriptions` grants users **select** on their own row and
+nothing else, and `stripe_events` has no policies at all — the only writer of either is
+the webhook, using the service-role key.
+
+`past_due` deliberately does not grant access: Stripe has already failed to collect and
+every generation costs money. A subscription set to cancel stays `active` until the
+period ends, so cancelling does not cut anyone off early.
+
+### Testing a payment locally
+
+Webhooks cannot reach `localhost` on their own, so forward them:
+
+```bash
+stripe listen --forward-to localhost:3001/api/stripe/webhook
+```
+
+Put the `whsec_...` it prints into `.env.local` and restart `next dev` — it mints a new
+one on every start, and a stale value makes every signature check fail. Then pay with
+test card `4242 4242 4242 4242`, any future expiry, any CVC.
+
+Because `/billing/return` grants access on its own, a broken webhook secret does *not*
+show up as a failed purchase. It shows up later, as renewals and cancellations quietly
+never applying.
+
+### Going live
+
+Configuration only, no code change. In live mode: recreate the product, the $9.99/month
+price and the Payment Link (pointing `after_completion` at
+`https://your-app/billing/return?session_id={CHECKOUT_SESSION_ID}`), add a webhook
+endpoint for `/api/stripe/webhook` subscribed to `checkout.session.completed` and
+`customer.subscription.*`, then set the live values in Vercel and redeploy.
+
 ## The webhook
 
 `N8N_WEBHOOK_URL` in `.env.local` points at the n8n webhook. The client never sees
@@ -80,12 +140,16 @@ included, is refused with an explanation.
 npx vercel
 ```
 
-Set all three environment variables in the Vercel project settings, for Production,
+Set every environment variable in the Vercel project settings, for Production,
 Preview and Development:
 
 | Variable | Notes |
 | --- | --- |
 | `N8N_WEBHOOK_URL` | Server-only. Treat as a credential. |
+| `STRIPE_SECRET_KEY` | Server-only. Can charge cards — treat as a credential. |
+| `STRIPE_WEBHOOK_SECRET` | Server-only. From the webhook endpoint in the dashboard. |
+| `STRIPE_PAYMENT_LINK_URL` | Server-only. The live-mode link, redirecting to the deployed URL. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Server-only. **Bypasses row level security.** |
 | `NEXT_PUBLIC_SUPABASE_URL` | Public by design. |
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Public by design. Not the service-role key. |
 
@@ -104,7 +168,7 @@ existing deployment is not enough.
 as a credential: anyone holding that URL can trigger your workflow and spend image
 generations. `.env.example` contains a placeholder only.
 
-Because `/api/tryon` costs money per call, it requires a signed-in session, is rate
+Because `/api/tryon` costs money per call, it requires an active subscription, is rate
 limited to 6 requests per minute per IP, restricted to same-origin browser requests,
 capped at 6 MB per request, and
 validates uploads by magic bytes rather than by the client's declared type. Responses
@@ -138,7 +202,7 @@ because JPEG has no alpha channel and a transparent PNG would otherwise go to bl
 
 | Path | Purpose |
 | --- | --- |
-| `middleware.ts` | Session refresh and the redirect for signed-out visitors |
+| `middleware.ts` | Session refresh, the login redirect and the paywall redirect |
 | `app/login/page.tsx`, `app/signup/page.tsx` | The two public pages |
 | `app/auth/actions.ts` | `signUp`, `signIn` and `signOut` server actions |
 | `components/AuthForm.tsx` | One form for both modes; `AuthShell.tsx` frames it |
@@ -150,6 +214,13 @@ because JPEG has no alpha channel and a transparent PNG would otherwise go to bl
 | `lib/image.ts` | Client-side type validation and downscaling |
 | `lib/upload-guard.ts` | Server-side magic-byte validation and size limits |
 | `lib/rate-limit.ts` | In-process rate limiter for the route |
+| `lib/billing.ts` | Reads the entitlement. Edge-safe, so it imports no Stripe code |
+| `lib/billing-sync.ts` | Everything that talks to Stripe and writes the entitlement |
+| `lib/stripe.ts` | The Stripe client, pinned to one API version |
+| `lib/supabase/admin.ts` | Service-role client. The webhook's only reason to exist |
+| `app/billing/` | The paywall and the post-checkout return page |
+| `app/api/stripe/webhook/route.ts` | Signature check, idempotency, subscription handlers |
+| `app/api/billing/portal/route.ts` | Redirect to the Stripe customer portal |
 | `app/globals.css` | Tailwind import and design tokens |
 | `next.config.ts` | Security headers and CSP |
 | `CLAUDE.md` | Working notes for Claude Code, incl. non-obvious constraints |
@@ -167,6 +238,17 @@ server can leave an orphaned Node process holding the port. Kill it by port:
 ```powershell
 Get-NetTCPConnection -State Listen -LocalPort 3001 | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
 ```
+
+**Checkout succeeds but sends you to `localhost` afterwards.** The Payment Link's
+`after_completion` redirect is baked into the link, not into the app. The test-mode
+link points at `http://localhost:3001`; a deployed environment needs its own link
+pointing at the deployed URL, set in that environment's `STRIPE_PAYMENT_LINK_URL`.
+The payment itself is fine either way — the webhook still grants access.
+
+**Access is granted at first, then never updates.** Renewals and cancellations arrive
+only by webhook, while the first purchase is also granted by `/billing/return`. So a
+wrong or stale `STRIPE_WEBHOOK_SECRET` looks like everything working, until it does
+not. Check the server log for `signature verification failed`.
 
 **Repeated `429` responses while testing.** The route allows 6 requests per minute and
 counts rejected ones too. Wait out the window.
