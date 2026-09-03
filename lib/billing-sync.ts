@@ -139,3 +139,54 @@ export async function reconcileCheckoutSession(
   await upsertSubscription(userId, subscription);
   return true;
 }
+
+/**
+ * Last-resort recovery: find a completed checkout for this user and grant it.
+ *
+ * This exists because of a real incident. A payment can be made and still leave
+ * the user on the paywall: the Payment Link's redirect can point at the wrong
+ * host (it is baked into the link, not the app), and the webhook can be failing
+ * for a reason nobody has noticed yet. When both grant paths miss, the only
+ * thing the paywall used to offer was the pay button - so the user pays a
+ * second time, and it still does not work.
+ *
+ * Scanning sessions is not elegant. Stripe cannot filter checkout sessions by
+ * client_reference_id, so this walks recent sessions newest-first and stops at
+ * the first match. It is bounded, it only runs when a user asks for it, and it
+ * verifies exactly what reconcileCheckoutSession verifies: the session must be
+ * complete and its client_reference_id must be this user.
+ */
+const RECOVERY_PAGES = 3;
+const RECOVERY_PAGE_SIZE = 100;
+
+export async function recoverAccess(userId: string): Promise<boolean> {
+  let startingAfter: string | undefined;
+
+  for (let page = 0; page < RECOVERY_PAGES; page += 1) {
+    const sessions = await stripe().checkout.sessions.list({
+      limit: RECOVERY_PAGE_SIZE,
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+    });
+
+    for (const session of sessions.data) {
+      if (session.client_reference_id !== userId) continue;
+      if (session.status !== 'complete') continue;
+
+      const subscriptionId =
+        typeof session.subscription === 'string'
+          ? session.subscription
+          : session.subscription?.id;
+      if (!subscriptionId) continue;
+
+      const subscription = await stripe().subscriptions.retrieve(subscriptionId);
+      await upsertSubscription(userId, subscription);
+      return true;
+    }
+
+    if (!sessions.has_more) break;
+    startingAfter = sessions.data.at(-1)?.id;
+    if (!startingAfter) break;
+  }
+
+  return false;
+}

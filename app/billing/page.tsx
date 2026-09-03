@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { Check, CreditCard } from 'lucide-react';
+import { AlertCircle, Check, CreditCard } from 'lucide-react';
 import AuthShell from '@/components/AuthShell';
 import { signOut } from '@/app/auth/actions';
 import { createClient } from '@/lib/supabase/server';
@@ -30,7 +30,19 @@ function formatDate(value: string | null): string {
   });
 }
 
-export default async function BillingPage() {
+const RECOVERY_MESSAGES: Record<string, string> = {
+  none: 'We could not find a completed payment for this account. If you have just paid, give it a few seconds and try again.',
+  error: 'We could not reach Stripe to check. Please try again in a moment.',
+};
+
+export default async function BillingPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ recover?: string }>;
+}) {
+  const { recover } = await searchParams;
+  const recoveryMessage = recover ? RECOVERY_MESSAGES[recover] : undefined;
+
   const supabase = await createClient();
   const {
     data: { user },
@@ -54,6 +66,16 @@ export default async function BillingPage() {
             ? 'Your subscription is active. Everything is unlocked.'
             : 'Every try-on runs a real image generation, so the app is a paid subscription.'}
         </p>
+
+        {recoveryMessage && (
+          <div
+            role="alert"
+            className="mt-6 flex items-start gap-2 rounded-md bg-bar px-4 py-3 text-sm"
+          >
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-accent" />
+            {recoveryMessage}
+          </div>
+        )}
 
         <div className="mt-8 rounded-2xl border border-hairline p-6">
           <div className="flex items-baseline justify-between">
@@ -115,6 +137,20 @@ export default async function BillingPage() {
               <p className="mt-3 text-center text-xs text-muted">
                 Secure checkout by Stripe. Cancel any time.
               </p>
+
+              {/*
+                The escape hatch. A payment can complete and still leave someone
+                here - a Payment Link redirecting at the wrong host, a webhook
+                that is misconfigured - and without this the only thing the page
+                offers is to pay a second time. It grants nothing that Stripe
+                does not already show as a completed checkout for this account.
+              */}
+              <a
+                href="/api/billing/recover"
+                className="mt-4 block text-center text-xs font-bold text-accent underline"
+              >
+                Already paid? Restore my access
+              </a>
             </>
           )}
         </div>

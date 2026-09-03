@@ -41,20 +41,60 @@ export async function POST(request: Request) {
 
   const body = await request.text();
 
+  /**
+   * Configuration errors are reported separately from signature failures.
+   *
+   * This is worth the extra branches: a missing STRIPE_WEBHOOK_SECRET, a
+   * missing STRIPE_SECRET_KEY and a genuinely forged request all used to come
+   * back as one flat "Invalid signature", which made a deployment missing an
+   * environment variable indistinguishable from an attack. The response body
+   * is only ever seen by Stripe - it is shown against the event in the
+   * dashboard, which is exactly where somebody debugging this will look.
+   */
+  let client: Stripe;
+  let secret: string;
+  try {
+    client = stripe();
+    secret = webhookSecret();
+  } catch (error) {
+    console.error('[stripe-webhook] not configured:', error);
+    return text(
+      'Stripe is not configured on this deployment: STRIPE_SECRET_KEY or ' +
+        'STRIPE_WEBHOOK_SECRET is missing.',
+      500,
+    );
+  }
+
   let event: Stripe.Event;
   try {
-    event = stripe().webhooks.constructEvent(body, signature, webhookSecret());
+    event = client.webhooks.constructEvent(body, signature, secret);
   } catch (error) {
-    // Either a forged request or a stale STRIPE_WEBHOOK_SECRET. `stripe listen`
-    // prints a fresh secret every time it starts, which is the usual cause.
+    // Either a forged request or the wrong STRIPE_WEBHOOK_SECRET. Each webhook
+    // endpoint has its own secret, and `stripe listen` mints another one on
+    // every start, so a mismatched value is by far the likelier cause.
     console.error('[stripe-webhook] signature verification failed:', error);
-    return text('Invalid signature.', 400);
+    return text(
+      'Signature check failed. If this deployment was working before, ' +
+        'STRIPE_WEBHOOK_SECRET does not match this endpoint.',
+      400,
+    );
   }
 
   // Claim the event id before doing any work. Stripe delivers at least once, so
   // a redelivery must not run the handler twice. The claim is released again if
   // the handler throws, so that Stripe's retry can pick it back up.
-  const admin = createAdminClient();
+  let admin: ReturnType<typeof createAdminClient>;
+  try {
+    admin = createAdminClient();
+  } catch (error) {
+    console.error('[stripe-webhook] not configured:', error);
+    return text(
+      'Supabase is not configured on this deployment: ' +
+        'SUPABASE_SERVICE_ROLE_KEY is missing.',
+      500,
+    );
+  }
+
   const { error: claimError } = await admin
     .from('stripe_events')
     .insert({ id: event.id, type: event.type });
