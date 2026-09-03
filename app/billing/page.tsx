@@ -32,9 +32,9 @@ function formatDate(value: string | null): string {
 
 const RECOVERY_MESSAGES: Record<string, string> = {
   none: 'We could not find a completed payment for this account. If you have just paid, give it a few seconds and try again.',
-  error: 'Something went wrong while checking with Stripe. Please try again in a moment.',
-  config:
-    'This deployment is missing part of its billing configuration, so we cannot confirm your payment. Nothing has been charged again — please contact support.',
+  stripe: 'Stripe did not answer when we checked for your payment. Please try again in a moment.',
+  database: 'We reached Stripe, but this deployment cannot write to its database. Its Supabase service-role key is set but not working.',
+  config: 'This deployment is missing part of its billing configuration, so we cannot confirm your payment. Nothing has been charged again.',
 };
 
 export default async function BillingPage({

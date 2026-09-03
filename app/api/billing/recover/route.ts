@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { recoverAccess } from '@/lib/billing-sync';
 import { createClient } from '@/lib/supabase/server';
+import { createAdminClient } from '@/lib/supabase/admin';
 
 /**
  * "I already paid" - re-grants access from a completed Stripe checkout.
@@ -14,6 +15,39 @@ import { createClient } from '@/lib/supabase/server';
  * having paid does nothing at all.
  */
 export const dynamic = 'force-dynamic';
+
+/**
+ * Works out which service actually failed, so the paywall can say something
+ * true rather than blaming whichever one is mentioned first.
+ *
+ * This is deliberately more than string matching on the thrown error. A
+ * service-role key that is *present but wrong* - the publishable key pasted by
+ * mistake, or a truncated one - throws from deep inside the Supabase client
+ * with a message that names no environment variable at all, and is otherwise
+ * indistinguishable from a Stripe outage. So the database is probed directly.
+ */
+async function classify(error: unknown): Promise<'config' | 'database' | 'stripe'> {
+  const detail = error instanceof Error ? error.message : '';
+  if (/SUPABASE_SERVICE_ROLE_KEY|STRIPE_SECRET_KEY|STRIPE_PAYMENT_LINK_URL/.test(detail)) {
+    return 'config';
+  }
+
+  try {
+    const { error: dbError } = await createAdminClient()
+      .from('subscriptions')
+      .select('user_id')
+      .limit(1);
+    if (dbError) {
+      console.error('[billing] service-role client cannot read:', dbError.message);
+      return 'database';
+    }
+  } catch (probeError) {
+    console.error('[billing] service-role client unusable:', probeError);
+    return 'config';
+  }
+
+  return 'stripe';
+}
 
 export async function GET(request: Request) {
   const supabase = await createClient();
@@ -30,14 +64,7 @@ export async function GET(request: Request) {
     recovered = await recoverAccess(user.id);
   } catch (error) {
     console.error('[billing] recovery failed:', error);
-    // A configuration error and a Stripe outage look nothing alike to whoever
-    // has to fix them, so they are not reported as the same thing. The first
-    // version of this said "could not reach Stripe" for both, which pointed
-    // debugging at the wrong service entirely.
-    const detail = error instanceof Error ? error.message : '';
-    const reason = /SUPABASE_SERVICE_ROLE_KEY|STRIPE_SECRET_KEY/.test(detail)
-      ? 'config'
-      : 'error';
+    const reason = await classify(error);
     return NextResponse.redirect(
       new URL(`/billing?recover=${reason}`, request.url),
       303,
