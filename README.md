@@ -1,26 +1,59 @@
 # Virtual Try-On
 
-Single-page app: upload a photo of a person and a garment, post both to an n8n
-webhook as `multipart/form-data`, and render the binary image the workflow returns.
+Single-page app behind a login: sign up with a name, an email address and a password,
+then upload a photo of a person and a garment, post both to an n8n webhook as
+`multipart/form-data`, and render the binary image the workflow returns.
 
-Next.js 15 (App Router) + TypeScript + Tailwind CSS v4 + lucide-react.
+Next.js 15 (App Router) + TypeScript + Tailwind CSS v4 + lucide-react, with Supabase
+for authentication.
 
 ## Run locally
 
 ```bash
 npm install
-cp .env.example .env.local   # then put your real webhook URL in it
+cp .env.example .env.local   # then fill in the webhook URL and Supabase keys
 npm run dev
 ```
 
-Open **http://localhost:3001** — the dev script is pinned to `-p 3001`.
+Open **http://localhost:3001** — the dev script is pinned to `-p 3001`. You land on
+`/login`; there is a link to `/signup` if you do not have an account yet.
 
-`.env.local` is gitignored, so a fresh clone will not have one. Without
-`N8N_WEBHOOK_URL` set, the page loads but Generate returns a 503.
+`.env.local` is gitignored, so a fresh clone will not have one. All three variables
+are needed: without the two `NEXT_PUBLIC_SUPABASE_*` values the app throws on its
+first Supabase call, and without `N8N_WEBHOOK_URL` you can sign in but Generate
+returns a 503.
 
 There is no test suite. Verify changes with `npm run build` (which also runs lint and
 typecheck) or `npx tsc --noEmit`. Avoid `npm run lint` — it invokes the deprecated
 `next lint`, which prompts interactively and will hang a non-interactive shell.
+
+## Auth
+
+Email and password accounts, via Supabase. Sign up takes a name, an email address and
+a password; the name is stored on the account and mirrored into a `public.profiles`
+row by a database trigger.
+
+The whole app is behind the login. `middleware.ts` refreshes the session on every
+request and redirects signed-out visitors to `/login`, with `/login` and `/signup`
+the only public paths. `/api/tryon` guards itself and answers `401` rather than
+redirecting, so an API caller gets a readable message instead of HTML.
+
+This is not decoration: every call to that route spends a real image generation, so an
+account is the primary cost control and the rate limiter is the second layer.
+
+Two setup steps that are **not** in the code, and that the app cannot do for you:
+
+1. **Set the two Supabase variables** in `.env.local` (and in Vercel — see below).
+   Both are `NEXT_PUBLIC_` and safe to expose; row level security is the real
+   boundary. Never put the service-role key in this project.
+2. **Turn off "Confirm email"** in the Supabase dashboard, under
+   *Authentication → Sign In / Providers → Email*, and press Save. The app is built
+   for instant login after signup. Leave it on and Supabase tries to send a
+   confirmation mail through its built-in mailer, which is capped at a couple of
+   messages per hour — signups then fail with `email rate limit exceeded`.
+
+Supabase's *URL Configuration* (Site URL, Redirect URLs) does not apply here. Those
+matter for email links, magic links and OAuth, none of which this flow uses.
 
 ## The webhook
 
@@ -47,8 +80,23 @@ included, is refused with an explanation.
 npx vercel
 ```
 
-Set `N8N_WEBHOOK_URL` as an environment variable in the Vercel project settings
-(Production, Preview and Development).
+Set all three environment variables in the Vercel project settings, for Production,
+Preview and Development:
+
+| Variable | Notes |
+| --- | --- |
+| `N8N_WEBHOOK_URL` | Server-only. Treat as a credential. |
+| `NEXT_PUBLIC_SUPABASE_URL` | Public by design. |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Public by design. Not the service-role key. |
+
+**Add them before the build, and redeploy after adding them.** The two
+`NEXT_PUBLIC_` values are baked in at build time, not read at runtime, and
+`next.config.ts` also derives the CSP's `connect-src` from
+`NEXT_PUBLIC_SUPABASE_URL` during the build. A build that ran without them ships a
+CSP with no Supabase origin, and the browser then blocks every auth request
+**silently** — the login form just spins, with nothing in the server logs and only a
+CSP violation in the browser console. Redeploying is what fixes it; promoting an
+existing deployment is not enough.
 
 ## Security
 
@@ -56,8 +104,9 @@ Set `N8N_WEBHOOK_URL` as an environment variable in the Vercel project settings
 as a credential: anyone holding that URL can trigger your workflow and spend image
 generations. `.env.example` contains a placeholder only.
 
-Because `/api/tryon` costs money per call, it is rate limited to 6 requests per minute
-per IP, restricted to same-origin browser requests, capped at 6 MB per request, and
+Because `/api/tryon` costs money per call, it requires a signed-in session, is rate
+limited to 6 requests per minute per IP, restricted to same-origin browser requests,
+capped at 6 MB per request, and
 validates uploads by magic bytes rather than by the client's declared type. Responses
 are allowlisted to JPEG/PNG/WEBP — an `image/svg+xml` reply is refused, since SVG can
 carry script. Upstream error bodies are logged server-side and never returned to the
@@ -66,6 +115,14 @@ caller. Security headers including a CSP are set in `next.config.ts`.
 The rate limiter is in-process, so on Vercel it applies per instance and resets on cold
 start — enough for casual abuse, not a determined one. Use a shared store (Upstash,
 Redis) if this goes anywhere public with real traffic.
+
+On the auth side: sessions are cookie-backed, so the middleware, server components and
+the route handler all see the same session. Every gate calls `getUser()` rather than
+`getSession()` — the latter trusts the cookie as-is, the former revalidates the JWT
+with Supabase. Failed logins return one generic message, so the form cannot be used to
+find out which addresses are registered. `public.profiles` has row level security
+scoped to `auth.uid() = id` and no insert policy, because rows arrive only via the
+signup trigger.
 
 ## Uploads
 
@@ -81,6 +138,11 @@ because JPEG has no alpha channel and a transparent PNG would otherwise go to bl
 
 | Path | Purpose |
 | --- | --- |
+| `middleware.ts` | Session refresh and the redirect for signed-out visitors |
+| `app/login/page.tsx`, `app/signup/page.tsx` | The two public pages |
+| `app/auth/actions.ts` | `signUp`, `signIn` and `signOut` server actions |
+| `components/AuthForm.tsx` | One form for both modes; `AuthShell.tsx` frames it |
+| `lib/supabase/` | Validated env plus the browser and server clients |
 | `app/page.tsx` | Page shell: utility bar, header, nav, hero, tips footer |
 | `components/TryOnStudio.tsx` | All state, the fetch call, and the output panel |
 | `components/UploadTile.tsx` | Drag & drop / click upload tile, preview, validation |
@@ -108,6 +170,17 @@ Get-NetTCPConnection -State Listen -LocalPort 3001 | ForEach-Object { Stop-Proce
 
 **Repeated `429` responses while testing.** The route allows 6 requests per minute and
 counts rejected ones too. Wait out the window.
+
+**Signup fails with "Too many attempts".** The server log shows the real cause,
+`email rate limit exceeded`. That error only occurs when Supabase is trying to send a
+confirmation email, which means "Confirm email" is still switched on — see **Auth**
+above. Waiting does not really help: the quota refills, but you land back in the
+confirmation flow.
+
+**The login form spins forever and nothing appears in the logs.** Almost always the
+CSP: `connect-src` is missing the Supabase origin, so the browser blocks the auth
+request before it leaves the page. Check the browser console for a CSP violation, then
+confirm `NEXT_PUBLIC_SUPABASE_URL` was set **at build time** and redeploy.
 
 **A warning about `@next/swc-win32-x64-msvc` on every build.** The native compiler
 binary is blocked by a Windows application-control policy, so Next falls back to the
