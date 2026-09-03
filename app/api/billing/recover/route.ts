@@ -30,7 +30,18 @@ export async function GET(request: Request) {
     recovered = await recoverAccess(user.id);
   } catch (error) {
     console.error('[billing] recovery failed:', error);
-    return NextResponse.redirect(new URL('/billing?recover=error', request.url), 303);
+    // A configuration error and a Stripe outage look nothing alike to whoever
+    // has to fix them, so they are not reported as the same thing. The first
+    // version of this said "could not reach Stripe" for both, which pointed
+    // debugging at the wrong service entirely.
+    const detail = error instanceof Error ? error.message : '';
+    const reason = /SUPABASE_SERVICE_ROLE_KEY|STRIPE_SECRET_KEY/.test(detail)
+      ? 'config'
+      : 'error';
+    return NextResponse.redirect(
+      new URL(`/billing?recover=${reason}`, request.url),
+      303,
+    );
   }
 
   return NextResponse.redirect(

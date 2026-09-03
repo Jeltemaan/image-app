@@ -32,7 +32,9 @@ function formatDate(value: string | null): string {
 
 const RECOVERY_MESSAGES: Record<string, string> = {
   none: 'We could not find a completed payment for this account. If you have just paid, give it a few seconds and try again.',
-  error: 'We could not reach Stripe to check. Please try again in a moment.',
+  error: 'Something went wrong while checking with Stripe. Please try again in a moment.',
+  config:
+    'This deployment is missing part of its billing configuration, so we cannot confirm your payment. Nothing has been charged again — please contact support.',
 };
 
 export default async function BillingPage({
