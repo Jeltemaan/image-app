@@ -2,6 +2,7 @@ import 'server-only';
 import type Stripe from 'stripe';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { paymentLinkUrl, stripe } from '@/lib/stripe';
+import { ACTIVE_STATUSES } from '@/lib/billing';
 
 /**
  * Writing the paywall entitlement, i.e. everything that touches Stripe.
@@ -151,16 +152,20 @@ export async function reconcileCheckoutSession(
  * second time, and it still does not work.
  *
  * Scanning sessions is not elegant. Stripe cannot filter checkout sessions by
- * client_reference_id, so this walks recent sessions newest-first and stops at
- * the first match. It is bounded, it only runs when a user asks for it, and it
- * verifies exactly what reconcileCheckoutSession verifies: the session must be
- * complete and its client_reference_id must be this user.
+ * client_reference_id, so this walks recent sessions newest-first looking for
+ * one that still grants something. It is bounded, it only runs when a user asks
+ * for it, and it verifies exactly what reconcileCheckoutSession verifies: the
+ * session must be complete and its client_reference_id must be this user.
  */
 const RECOVERY_PAGES = 3;
 const RECOVERY_PAGE_SIZE = 100;
 
 export async function recoverAccess(userId: string): Promise<boolean> {
   let startingAfter: string | undefined;
+  // The newest matching subscription, whatever its state. Used only as a
+  // fallback, so that a user who really has nothing active still ends up with
+  // an accurate row rather than none at all.
+  let newestMatch: Stripe.Subscription | null = null;
 
   for (let page = 0; page < RECOVERY_PAGES; page += 1) {
     const sessions = await stripe().checkout.sessions.list({
@@ -179,6 +184,15 @@ export async function recoverAccess(userId: string): Promise<boolean> {
       if (!subscriptionId) continue;
 
       const subscription = await stripe().subscriptions.retrieve(subscriptionId);
+      newestMatch ??= subscription;
+
+      // Keep looking past a completed checkout whose subscription has since
+      // been cancelled. Somebody who paid twice, or resubscribed after
+      // cancelling, has more than one completed session, and only one of them
+      // still grants anything - stopping at the newest would restore a dead
+      // subscription and report success while the paywall stayed up.
+      if (!ACTIVE_STATUSES.has(subscription.status)) continue;
+
       await upsertSubscription(userId, subscription);
       return true;
     }
@@ -188,5 +202,8 @@ export async function recoverAccess(userId: string): Promise<boolean> {
     if (!startingAfter) break;
   }
 
+  if (newestMatch) {
+    await upsertSubscription(userId, newestMatch);
+  }
   return false;
 }

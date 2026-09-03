@@ -33,7 +33,7 @@ export type SubscriptionRow = {
  * set to cancel at period end stays `active` until that date, so cancelling
  * does not cut access off early - that is intended.
  */
-const ACTIVE_STATUSES = new Set(['active', 'trialing']);
+export const ACTIVE_STATUSES = new Set(['active', 'trialing']);
 
 /** The one definition of "this user may generate". */
 export function hasActiveAccess(row: SubscriptionRow | null): boolean {
